@@ -1,0 +1,12 @@
+[project]
+name = "supermocks"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "h5py>=3.16.0",
+    "hdf5plugin>=7.0.0",
+    "healpy>=1.20.0",
+    "numpy>=2.5.2",
+]
