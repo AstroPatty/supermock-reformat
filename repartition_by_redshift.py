@@ -37,7 +37,6 @@ from supermock_raw import (
     validate_patch,
 )
 
-
 REDSHIFT_KEY = "redshift"
 
 
@@ -100,12 +99,6 @@ def core_id(group):
         raise RawLayoutError(f"Unexpected catalog core group name: {group!r}") from exc
 
 
-def slab_rows(dataset, chunk_rows):
-    """Bound each source read to ``chunk_rows`` elements, not matrix rows."""
-    width = max(1, int(np.prod(dataset.shape[1:], dtype=np.int64)))
-    return max(1, int(chunk_rows) // width)
-
-
 def verify(raw_root):
     """Check the cheap scalar invariants that establish raw-file alignment."""
     patches = discover_skypatches(raw_root)
@@ -117,9 +110,10 @@ def verify(raw_root):
         catalog_path = patch_path(raw_root, patch, "lightcone_catalogs")
         luminosity_path = patch_path(raw_root, patch, "luminosities")
         groups, sizes, offsets, _ = patch_offsets(catalog_path)
-        with h5py.File(catalog_path, "r") as catalog, h5py.File(
-            luminosity_path, "r"
-        ) as luminosities:
+        with (
+            h5py.File(catalog_path, "r") as catalog,
+            h5py.File(luminosity_path, "r") as luminosities,
+        ):
             for group, size, offset in zip(groups, sizes, offsets):
                 catalog_z = catalog[group][REDSHIFT_KEY]
                 flat_z = luminosities[REDSHIFT_KEY]
@@ -191,12 +185,18 @@ def create_outputs(
         for name, source in columns.items():
             shape = (total,) + tuple(source.extra_shape)
             chunks, kwargs = storage_opts(source.dtype, shape, compression, level)
-            dst.create_dataset(name, shape=shape, dtype=source.dtype, chunks=chunks, **kwargs)
+            dst.create_dataset(
+                name, shape=shape, dtype=source.dtype, chunks=chunks, **kwargs
+            )
         for name in ("skypatch", "source_core"):
             chunks, kwargs = storage_opts(np.int32, (total,), compression, level)
-            dst.create_dataset(name, shape=(total,), dtype=np.int32, chunks=chunks, **kwargs)
+            dst.create_dataset(
+                name, shape=(total,), dtype=np.int32, chunks=chunks, **kwargs
+            )
         for name, values in grids.items():
-            chunks, kwargs = storage_opts(values.dtype, values.shape, compression, level)
+            chunks, kwargs = storage_opts(
+                values.dtype, values.shape, compression, level
+            )
             dst.create_dataset(name, data=values, chunks=chunks, **kwargs)
         handles.append(dst)
     return handles
@@ -233,7 +233,6 @@ def repartition(
     n_partitions,
     prefix,
     decimals,
-    chunk_rows,
     time_grids,
     compression,
     level,
@@ -255,15 +254,11 @@ def repartition(
     columns = resolve_columns(raw_root, patches[0])
     for patch in patches[1:]:
         if resolve_columns(raw_root, patch) != columns:
-            raise RawLayoutError(f"Patch {patch} has a different resolved column layout")
+            raise RawLayoutError(
+                f"Patch {patch} has a different resolved column layout"
+            )
     grids = load_time_grids(time_grids)
     print(f"\n  output columns: {len(columns)}")
-    print(
-        "  source slabs are capped at "
-        f"{chunk_rows:,} elements (not rows), limiting a float64 slab to "
-        f"{chunk_rows * 8 / (1 << 20):.1f} MiB."
-    )
-
     set_blosc_threads(1)
     outputs = create_outputs(
         out_dir,
@@ -293,25 +288,27 @@ def repartition(
                 with h5py.File(catalog_path, "r") as catalog:
                     for group in groups:
                         dataset = catalog[group][source.dataset]
-                        rows = slab_rows(dataset, chunk_rows)
-                        for lo in range(0, dataset.shape[0], rows):
-                            hi = min(dataset.shape[0], lo + rows)
-                            bins = assign_bins(catalog[group][REDSHIFT_KEY][lo:hi], edges)
-                            values = dataset[lo:hi]
-                            scatter(outputs, bins, cursors, [(name, values)])
+                        bins = assign_bins(catalog[group][REDSHIFT_KEY][:], edges)
+                        values = dataset[:]
+                        scatter(outputs, bins, cursors, [(name, values)])
                 if not np.array_equal(cursors, starts[patch] + counts_by_patch[patch]):
-                    raise AssertionError(f"Catalog cursor mismatch for {name}, patch {patch}")
+                    raise AssertionError(
+                        f"Catalog cursor mismatch for {name}, patch {patch}"
+                    )
 
             cursors = starts[patch].copy()
             with h5py.File(catalog_path, "r") as catalog:
                 for group in groups:
                     dataset = catalog[group][REDSHIFT_KEY]
-                    for lo in range(0, dataset.shape[0], slab_rows(dataset, chunk_rows)):
-                        hi = min(dataset.shape[0], lo + slab_rows(dataset, chunk_rows))
-                        bins = assign_bins(dataset[lo:hi], edges)
-                        values = np.full(hi - lo, patch, dtype=np.int32)
-                        cores = np.full(hi - lo, core_id(group), dtype=np.int32)
-                        scatter(outputs, bins, cursors, [("skypatch", values), ("source_core", cores)])
+                    bins = assign_bins(dataset[:], edges)
+                    values = np.full(len(dataset), patch, dtype=np.int32)
+                    cores = np.full(len(dataset), core_id(group), dtype=np.int32)
+                    scatter(
+                        outputs,
+                        bins,
+                        cursors,
+                        [("skypatch", values), ("source_core", cores)],
+                    )
             if not np.array_equal(cursors, starts[patch] + counts_by_patch[patch]):
                 raise AssertionError(f"Provenance cursor mismatch for patch {patch}")
             final_cursors += cursors - starts[patch]
@@ -322,23 +319,30 @@ def repartition(
                 for name, source in columns.items():
                     if source.kind == kind:
                         sources.setdefault(source.dataset, []).append((name, source))
-                with h5py.File(path, "r") as flat, h5py.File(catalog_path, "r") as catalog:
+                with (
+                    h5py.File(path, "r") as flat,
+                    h5py.File(catalog_path, "r") as catalog,
+                ):
                     for dataset_name, names in sources.items():
                         dataset = flat[dataset_name]
-                        rows = slab_rows(dataset, chunk_rows)
                         cursors = starts[patch].copy()
                         for group, size, offset in zip(groups, sizes, offsets):
                             z = catalog[group][REDSHIFT_KEY]
-                            for lo in range(0, int(size), rows):
-                                hi = min(int(size), lo + rows)
-                                bins = assign_bins(z[lo:hi], edges)
-                                slab = dataset[int(offset) + lo:int(offset) + hi]
-                                values = [
-                                    (name, slab if source.col_index is None else slab[:, source.col_index])
-                                    for name, source in names
-                                ]
-                                scatter(outputs, bins, cursors, values)
-                        if not np.array_equal(cursors, starts[patch] + counts_by_patch[patch]):
+                            bins = assign_bins(z[:], edges)
+                            slab = dataset[int(offset) : int(offset) + len(z)]
+                            values = [
+                                (
+                                    name,
+                                    slab
+                                    if source.col_index is None
+                                    else slab[:, source.col_index],
+                                )
+                                for name, source in names
+                            ]
+                            scatter(outputs, bins, cursors, values)
+                        if not np.array_equal(
+                            cursors, starts[patch] + counts_by_patch[patch]
+                        ):
                             raise AssertionError(
                                 f"Flat cursor mismatch for {dataset_name}, patch {patch}"
                             )
@@ -353,17 +357,39 @@ def repartition(
     cursors = final_cursors
     if not np.array_equal(cursors, expected):
         sys.exit(f"Row count mismatch!\n  expected: {expected}\n  written:  {cursors}")
-    print(f"\nDone. {int(expected.sum()):,} objects across {len(outputs)} partition(s) in {out_dir!r}")
+    print(
+        f"\nDone. {int(expected.sum()):,} objects across {len(outputs)} partition(s) in {out_dir!r}"
+    )
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Re-partition raw SuperMock catalogs into equal-population redshift bins.")
-    parser.add_argument("--raw-root", default="raw", help="root directory containing raw/ catalog kinds (default: raw)")
-    parser.add_argument("-n", "--n-partitions", type=int, default=16, help="number of redshift partitions (default: 16)")
-    parser.add_argument("-o", "--output-dir", default="repartitioned", help="directory for output files")
-    parser.add_argument("-p", "--prefix", default="SuperMock_v3", help="output filename prefix")
-    parser.add_argument("--decimals", type=int, default=2, help="decimal places for redshift bounds (default: 2)")
-    parser.add_argument("--chunk-rows", type=int, default=2_000_000, help="maximum source elements per slab (default: 2,000,000; caps wide-matrix memory)")
+    parser = argparse.ArgumentParser(
+        description="Re-partition raw SuperMock catalogs into equal-population redshift bins."
+    )
+    parser.add_argument(
+        "--raw-root",
+        default="raw",
+        help="root directory containing raw/ catalog kinds (default: raw)",
+    )
+    parser.add_argument(
+        "-n",
+        "--n-partitions",
+        type=int,
+        default=16,
+        help="number of redshift partitions (default: 16)",
+    )
+    parser.add_argument(
+        "-o", "--output-dir", default="repartitioned", help="directory for output files"
+    )
+    parser.add_argument(
+        "-p", "--prefix", default="SuperMock_v3", help="output filename prefix"
+    )
+    parser.add_argument(
+        "--decimals",
+        type=int,
+        default=2,
+        help="decimal places for redshift bounds (default: 2)",
+    )
     parser.add_argument(
         "--chunk-cache-mb",
         type=int,
@@ -374,21 +400,35 @@ def main():
             "dominant memory cost of this stage"
         ),
     )
-    parser.add_argument("--time-grids", default=DEFAULT_TIME_GRIDS, help="path to time_grids.npz")
-    parser.add_argument("--verify", action="store_true", help="verify raw alignment without writing outputs")
+    parser.add_argument(
+        "--time-grids", default=DEFAULT_TIME_GRIDS, help="path to time_grids.npz"
+    )
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="verify raw alignment without writing outputs",
+    )
     add_compression_args(parser)
     args = parser.parse_args()
     if args.n_partitions < 1:
         sys.exit("--n-partitions must be >= 1")
-    if args.chunk_rows < 1:
-        sys.exit("--chunk-rows must be >= 1")
     if args.chunk_cache_mb < 1:
         sys.exit("--chunk-cache-mb must be >= 1")
     try:
         if args.verify:
             verify(args.raw_root)
         else:
-            repartition(args.raw_root, args.output_dir, args.n_partitions, args.prefix, args.decimals, args.chunk_rows, args.time_grids, args.compression, args.compression_level, args.chunk_cache_mb)
+            repartition(
+                args.raw_root,
+                args.output_dir,
+                args.n_partitions,
+                args.prefix,
+                args.decimals,
+                args.time_grids,
+                args.compression,
+                args.compression_level,
+                args.chunk_cache_mb,
+            )
     except RawLayoutError as exc:
         sys.exit(f"Raw layout error: {exc}")
 

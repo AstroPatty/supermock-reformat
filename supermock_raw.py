@@ -16,7 +16,6 @@ from glob import glob
 import h5py
 import numpy as np
 
-
 KINDS = {
     "lightcone_catalogs": "lightcone_galaxies",
     "luminosities": "luminosities",
@@ -33,9 +32,7 @@ _TIME_GRIDS_PATH = os.path.join(
     "SuperMockLoad", "supermockload", "data", "time_grids.npz"
 )
 
-ColumnSource = namedtuple(
-    "ColumnSource", "kind dataset col_index dtype extra_shape"
-)
+ColumnSource = namedtuple("ColumnSource", "kind dataset col_index dtype extra_shape")
 
 
 class RawLayoutError(RuntimeError):
@@ -123,6 +120,7 @@ def _with_catalog(path_or_handle, callback):
 
 def core_groups(path_or_handle):
     """Return catalog core groups in the producer's flat-file row order."""
+
     def get_groups(handle):
         # PLAN §1.3 verified sorted(f.keys()) against luminosity redshifts for
         # all 62 groups. Numeric sorting fails at core_8 (3.33 vs 5.46), silently
@@ -138,9 +136,12 @@ def patch_offsets(path_or_handle):
     ``offsets[i]`` is the flat-file starting row for ``groups[i]``; it has the
     same length as ``groups`` rather than including a final sentinel.
     """
+
     def get_offsets(handle):
         groups = core_groups(handle)
-        sizes = np.array([handle[group]["redshift"].shape[0] for group in groups], dtype=np.int64)
+        sizes = np.array(
+            [handle[group]["redshift"].shape[0] for group in groups], dtype=np.int64
+        )
         offsets = np.empty(len(sizes), dtype=np.int64)
         if len(sizes):
             offsets[0] = 0
@@ -157,7 +158,9 @@ def _flat_row_count(path, kind):
             raise RawLayoutError(f"{kind} file {path} contains no datasets")
         counts = {name: handle[name].shape[0] for name in names}
     if len(set(counts.values())) != 1:
-        raise RawLayoutError(f"{kind} file {path} has inconsistent row counts: {counts}")
+        raise RawLayoutError(
+            f"{kind} file {path} has inconsistent row counts: {counts}"
+        )
     return next(iter(counts.values()))
 
 
@@ -227,7 +230,13 @@ def resolve_columns(root, patch, band_names_path=None):
             _add_column(
                 columns,
                 dataset_name,
-                ColumnSource("lightcone_catalogs", dataset_name, None, dataset.dtype, dataset.shape[1:]),
+                ColumnSource(
+                    "lightcone_catalogs",
+                    dataset_name,
+                    None,
+                    dataset.dtype,
+                    dataset.shape[1:],
+                ),
             )
 
     with h5py.File(patch_path(root, patch, "luminosities"), "r") as luminosities:
@@ -245,13 +254,21 @@ def resolve_columns(root, patch, band_names_path=None):
                     _add_column(
                         columns,
                         f"{dataset_name}_{band}",
-                        ColumnSource("luminosities", dataset_name, index, dataset.dtype, ()),
+                        ColumnSource(
+                            "luminosities", dataset_name, index, dataset.dtype, ()
+                        ),
                     )
             else:
                 _add_column(
                     columns,
                     dataset_name,
-                    ColumnSource("luminosities", dataset_name, None, dataset.dtype, dataset.shape[1:]),
+                    ColumnSource(
+                        "luminosities",
+                        dataset_name,
+                        None,
+                        dataset.dtype,
+                        dataset.shape[1:],
+                    ),
                 )
 
     with h5py.File(patch_path(root, patch, "photometry"), "r") as photometry:
@@ -318,7 +335,7 @@ def open_output(path, mode="w", chunk_cache_mb=256):
     )
 
 
-def storage_opts(dtype, shape, compression="blosc", level=5):
+def storage_opts(dtype, shape, compression="none", level=5):
     """Return chunk geometry and create_dataset keyword arguments for a dataset."""
     shape = tuple(shape)
     if not shape or shape[0] == 0:
@@ -378,7 +395,9 @@ def load_time_grids(path=None):
     with np.load(data_path) as grids:
         missing = sorted(set(expected) - set(grids.files))
         if missing:
-            raise RawLayoutError(f"Time-grid file {data_path} is missing keys: {missing}")
+            raise RawLayoutError(
+                f"Time-grid file {data_path} is missing keys: {missing}"
+            )
         result = {name: grids[name] for name in expected}
     for name, length in expected.items():
         if result[name].shape != (length,):
