@@ -36,9 +36,11 @@ Usage
     python spatial_index.py --level 5 --processes 8
 
 Each input file is reordered independently, so whole files are scattered
-across worker processes.  The work is dominated by reading, permuting and
-writing multi-GB columns, so it scales with available I/O bandwidth and
-memory: each worker holds roughly one block of its own file at a time.
+across worker processes.  The pixel permutation is global, so each worker
+reads one whole column of its file into RAM, permutes it there, and streams it
+back out chunk-aligned -- sequential on both sides, no scattered disk I/O.
+Peak memory is therefore roughly (largest column) * (worker processes); the
+largest column is ``sfh`` (float64, 117 wide).  Size ``--processes`` to fit.
 """
 
 import argparse
@@ -46,6 +48,7 @@ import glob
 import os
 import shutil
 import sys
+from collections import namedtuple
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import h5py
@@ -56,11 +59,17 @@ from supermock_raw import (
     add_compression_args,
     open_output,
     set_blosc_threads,
+    should_compress,
     storage_opts,
 )
 
 RA_KEY = "ra"
 DEC_KEY = "dec"
+
+# Output storage settings passed as one unit through the worker job tuple.
+OutputPolicy = namedtuple(
+    "OutputPolicy", "compression compression_level chunk_cache_mb chunk_bytes"
+)
 
 # Shared 1-D axes: one value per history bin, not one row per object.
 SHARED_DATASETS = (
@@ -196,16 +205,7 @@ def occupancy(levels, level):
     )
 
 
-def reorder_file(
-    in_path,
-    out_path,
-    level,
-    block_rows,
-    progress,
-    compression,
-    compression_level,
-    chunk_cache_mb,
-):
+def reorder_file(in_path, out_path, level, block_rows, progress, policy):
     """Rewrite one file, sorted by HEALPix pixel.  Returns lines to log.
 
     Nothing here prints directly except the transient progress line: with
@@ -213,11 +213,9 @@ def reorder_file(
     so messages are returned and printed by the parent once the file is done.
     """
     log = []
-    # Stage-1 inputs use Blosc too, so register its filter before opening either file.
-
     with (
         h5py.File(in_path, "r") as src,
-        open_output(out_path, chunk_cache_mb=chunk_cache_mb) as dst,
+        open_output(out_path, chunk_cache_mb=policy.chunk_cache_mb) as dst,
     ):
         if RA_KEY not in src or DEC_KEY not in src:
             raise ValueError(f"{os.path.basename(in_path)} has no {RA_KEY}/{DEC_KEY}")
@@ -245,8 +243,17 @@ def reorder_file(
         data = dst.create_group("data")
         for i, name in enumerate(columns, 1):
             ref = src[name]
+            # Whole column into RAM: one sequential read, RAM-speed permute, one
+            # sequential write.  Any block-at-a-time scheme would turn the global
+            # permutation into scattered I/O on one side or the other.
+            values = ref[:]
             chunks, compression_args = storage_opts(
-                ref.dtype, ref.shape, compression, compression_level
+                ref.dtype,
+                ref.shape,
+                policy.compression,
+                policy.compression_level,
+                compress=should_compress(values),
+                chunk_bytes=policy.chunk_bytes,
             )
             out = data.create_dataset(
                 name,
@@ -257,16 +264,11 @@ def reorder_file(
             )
             annotate(out, name)
 
-            # ``order`` is a gather. h5py requires fancy indices to increase,
-            # so sort each block for the read and restore stable-sort order for
-            # its contiguous destination slice.
-            rows = block_rows or (chunks[0] if chunks else 1)
-            for lo in range(0, n, rows):
-                hi = min(lo + rows, n)
-                source_rows = order[lo:hi]
-                read_order = np.argsort(source_rows)
-                values = ref[source_rows[read_order]]
-                out[lo:hi] = values[np.argsort(read_order)]
+            step = block_rows or (chunks[0] if chunks else 16 << 20)
+            for lo in range(0, n, step):
+                hi = min(lo + step, n)
+                out[lo:hi] = values[order[lo:hi]]
+            del values
 
             if progress:
                 print(
@@ -303,28 +305,10 @@ def process_one(job):
     success, so an interrupted or failed run never leaves a truncated file
     that a later --overwrite-less run would mistake for finished work.
     """
-    (
-        in_path,
-        out_path,
-        level,
-        block_rows,
-        progress,
-        compression,
-        compression_level,
-        chunk_cache_mb,
-    ) = job
+    in_path, out_path, level, block_rows, progress, policy = job
     tmp_path = out_path + ".partial"
     try:
-        log = reorder_file(
-            in_path,
-            tmp_path,
-            level,
-            block_rows,
-            progress,
-            compression,
-            compression_level,
-            chunk_cache_mb,
-        )
+        log = reorder_file(in_path, tmp_path, level, block_rows, progress, policy)
         shutil.move(tmp_path, out_path)
         return os.path.basename(in_path), log, None
     except BaseException as exc:
@@ -333,17 +317,7 @@ def process_one(job):
         return os.path.basename(in_path), [], f"{type(exc).__name__}: {exc}"
 
 
-def run(
-    in_dir,
-    out_dir,
-    level,
-    block_rows,
-    overwrite,
-    processes,
-    compression,
-    compression_level,
-    chunk_cache_mb,
-):
+def run(in_dir, out_dir, level, block_rows, overwrite, processes, policy):
     paths = sorted(glob.glob(os.path.join(in_dir, "*.hdf5")))
     if not paths:
         sys.exit(f"No .hdf5 files found in {in_dir!r}")
@@ -366,18 +340,7 @@ def run(
         if os.path.exists(out_path) and not overwrite:
             print(f"  {name}: exists, skipping (use --overwrite)")
             continue
-        jobs.append(
-            (
-                path,
-                out_path,
-                level,
-                block_rows,
-                False,
-                compression,
-                compression_level,
-                chunk_cache_mb,
-            )
-        )
+        jobs.append((path, out_path, level, block_rows, False, policy))
 
     if not jobs:
         print("\nNothing to do.")
@@ -453,7 +416,7 @@ def main():
         type=int,
         default=None,
         metavar="N",
-        help="permute each column in blocks of N rows; omit to use the output "
+        help="write each column in slices of N rows; omit to use the output "
         "chunk row count (default)",
     )
     parser.add_argument(
@@ -462,7 +425,8 @@ def main():
         type=int,
         default=1,
         metavar="N",
-        help="number of worker processes; files are scattered across them (default: 1)",
+        help="number of worker processes; files are scattered across them. Peak "
+        "memory is about (largest column) * N (default: 1)",
     )
     parser.add_argument(
         "--overwrite",
@@ -472,8 +436,16 @@ def main():
     parser.add_argument(
         "--chunk-cache-mb",
         type=int,
-        default=256,
-        help="HDF5 raw chunk cache per output file in MB (default: 256)",
+        default=32,
+        help="HDF5 raw chunk cache per output file in MB (default: 32)",
+    )
+    parser.add_argument(
+        "--chunk-kib",
+        type=int,
+        default=1024,
+        metavar="N",
+        help="uncompressed bytes per output chunk, in KiB; smaller reads back "
+        "small sky cones with less over-read (default: 1024)",
     )
     add_compression_args(parser)
     args = parser.parse_args()
@@ -486,11 +458,19 @@ def main():
         sys.exit("--processes must be >= 1")
     if args.chunk_cache_mb < 1:
         sys.exit("--chunk-cache-mb must be >= 1")
+    if args.chunk_kib < 1:
+        sys.exit("--chunk-kib must be >= 1")
 
     # Set this before hdf5plugin is imported and before workers start, so child
     # processes inherit the correct per-worker Blosc thread count.
     set_blosc_threads(args.processes)
 
+    policy = OutputPolicy(
+        args.compression,
+        args.compression_level,
+        args.chunk_cache_mb,
+        args.chunk_kib << 10,
+    )
     run(
         args.input_dir,
         args.output_dir,
@@ -498,9 +478,7 @@ def main():
         args.block_rows,
         args.overwrite,
         args.processes,
-        args.compression,
-        args.compression_level,
-        args.chunk_cache_mb,
+        policy,
     )
 
 

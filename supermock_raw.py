@@ -296,7 +296,34 @@ def resolve_columns(root, patch, band_names_path=None):
 # populated low mantissa bits that shuffle harms (sfh: 4.02x vs 1.34x); 1-D
 # data benefits from byte shuffle.  Only float64 2-D arrays need width 3
 # (sfh full-width falls from 4.06x to 2.02x); other 2-D arrays want full width.
-# Roughly 8 MB uncompressed chunks were sufficient: width, not volume, mattered.
+# Chunk *volume* barely moved any ratio over 0.5-30 MB (PLAN §4.3), so the
+# final stage sizes it from the smallest spatial query instead of the codec.
+#
+# The same measurements show which columns are worth compressing at all:
+# 2-D history arrays (2.8-40x) and small-range integers -- flags, states,
+# ranks, provenance ids (up to 66x) -- are; continuous 1-D floats such as
+# ra/dec/redshift, positions, velocities and magnitudes (1.1-1.3x) and
+# high-cardinality identifier integers are not.  On a spatially-queried file an
+# unfiltered contiguous column also gives the fastest index-driven slice read,
+# so ``should_compress`` keeps those uncompressed.
+
+_SMALL_INT_RANGE = 1 << 16
+
+
+def should_compress(values):
+    """Whether a column benefits enough from compression to be worth chunking.
+
+    ``values`` is the materialised column (any shape).  See the note above for
+    the measured rationale.
+    """
+    if values.ndim > 1:
+        return True
+    if values.dtype == np.bool_:
+        return True
+    if np.issubdtype(values.dtype, np.integer) and values.size:
+        spread = int(values.max()) - int(values.min())
+        return spread < _SMALL_INT_RANGE
+    return False
 
 
 def _ensure_hdf5plugin():
@@ -316,17 +343,18 @@ def set_blosc_threads(processes):
     os.environ["BLOSC_NTHREADS"] = str(max(1, (os.cpu_count() or 1) // processes))
 
 
-def open_output(path, mode="w", chunk_cache_mb=256):
-    """Open an output HDF5 file with a cache sized for partial chunk writes."""
+def open_output(path, mode="w", chunk_cache_mb=32):
+    """Open an output HDF5 file with a raw chunk cache of the requested size.
+
+    Both pipeline stages now write each chunk exactly once and in order (stage 1
+    is contiguous and unfiltered; stage 2 permutes a whole column in RAM then
+    streams chunk-aligned), so the cache only needs to hold the few chunks in
+    flight.  ``rdcc_nslots`` stays large and prime -- it costs almost nothing and
+    covers stage 2's many small chunks.
+    """
     chunk_cache_mb = int(chunk_cache_mb)
     if chunk_cache_mb < 1:
         raise ValueError("chunk_cache_mb must be >= 1")
-    # Stage 1 scatters roughly 1,068-row slabs across output bins.  On core_19
-    # sfh data, the default 1 MB cache wrote 5,887 rows/s; a 256 MB cache wrote
-    # 2.68M rows/s at the identical 4.14 compression ratio.  The large cache
-    # keeps the 8 MB chunks resident instead of repeatedly recompressing them.
-    # 100003 is prime and comfortably exceeds the 32 8 MB chunks resident at
-    # 256 MB; retain it for stage 2's smaller, more numerous chunks.
     return h5py.File(
         path,
         mode,
@@ -335,10 +363,20 @@ def open_output(path, mode="w", chunk_cache_mb=256):
     )
 
 
-def storage_opts(dtype, shape, compression="none", level=5):
-    """Return chunk geometry and create_dataset keyword arguments for a dataset."""
+def storage_opts(dtype, shape, compression="none", level=5, compress=True,
+                 chunk_bytes=8 << 20):
+    """Return chunk geometry and create_dataset keyword arguments for a dataset.
+
+    ``compress=False`` (or ``compression="none"``) stores the dataset
+    contiguously and unfiltered -- the fastest layout for index-driven slice
+    reads.  ``chunk_bytes`` is the uncompressed size targeted per chunk when the
+    dataset is compressed; ratio is insensitive to it (PLAN §4.3), so callers
+    set it from the smallest expected read.
+    """
     shape = tuple(shape)
     if not shape or shape[0] == 0:
+        return None, {}
+    if compression == "none" or not compress:
         return None, {}
     dtype = np.dtype(dtype)
     ndim = len(shape)
@@ -348,11 +386,9 @@ def storage_opts(dtype, shape, compression="none", level=5):
     else:
         tail = ()
     bytes_per_row = max(1, dtype.itemsize * int(np.prod(tail, dtype=np.int64)))
-    rows = max(1, min(shape[0], (8 << 20) // bytes_per_row))
+    rows = max(1, min(shape[0], int(chunk_bytes) // bytes_per_row))
     chunks = (rows,) + tail
 
-    if compression == "none":
-        return chunks, {}
     if compression == "gzip":
         return chunks, {"compression": "gzip", "compression_opts": level}
     if compression == "lzf":

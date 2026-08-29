@@ -12,6 +12,12 @@ No objects are filtered out: this is a lossless reorganisation.  The invalid
 magnitude cleaning in ``load_supermock.load_and_clean_single_catalog`` is
 deliberately NOT applied here, since it is redshift dependent and is better
 left to downstream analysis.
+
+This is an intermediate stage: its outputs are consumed and rewritten by later
+stages, so the datasets are written **uncompressed and contiguous**.  That
+removes the filter pipeline, chunk cache and chunk B-tree from the write path,
+leaving each bin fill as a single positioned write -- essentially a raw byte
+copy from the source slab to its reserved span in the output file.
 """
 
 import argparse
@@ -24,7 +30,6 @@ import numpy as np
 from supermock_raw import (
     DEFAULT_TIME_GRIDS,
     RawLayoutError,
-    add_compression_args,
     core_groups,
     discover_skypatches,
     load_time_grids,
@@ -32,8 +37,6 @@ from supermock_raw import (
     patch_offsets,
     patch_path,
     resolve_columns,
-    set_blosc_threads,
-    storage_opts,
     validate_patch,
 )
 
@@ -155,49 +158,36 @@ def gather_redshifts(raw_root, patches):
     return np.concatenate(chunks), patch_counts
 
 
-def create_outputs(
-    out_dir,
-    prefix,
-    edges,
-    counts,
-    columns,
-    grids,
-    patches,
-    compression,
-    level,
-    chunk_cache_mb=256,
-):
-    """Create pre-sized output files and every dataset with the shared policy."""
+def create_outputs(out_dir, prefix, edges, counts, columns, grids, patches):
+    """Create pre-sized output files with uncompressed, contiguous datasets.
+
+    Contiguous layout means every dataset occupies one flat run of bytes, so a
+    write to ``dst[name][lo:hi]`` is a single ``pwrite`` at a known offset with
+    no chunk cache, chunk B-tree or filter pipeline involved.
+    """
     os.makedirs(out_dir, exist_ok=True)
     handles = []
-    for i in range(len(edges) - 1):
+    n_bins = len(edges) - 1
+    for i in range(n_bins):
         lo, hi = edges[i], edges[i + 1]
         path = os.path.join(out_dir, f"{prefix}_z_{lo:05.2f}_{hi:05.2f}.hdf5")
-        dst = open_output(path, chunk_cache_mb=chunk_cache_mb)
+        # A contiguous dataset never touches the raw chunk cache, so keep it tiny.
+        dst = open_output(path, chunk_cache_mb=1)
         total = int(counts[i])
         dst.attrs["z_min"] = lo
         dst.attrs["z_max"] = hi
         dst.attrs["partition_index"] = i
-        dst.attrs["n_partitions"] = len(edges) - 1
+        dst.attrs["n_partitions"] = n_bins
         dst.attrs["n_objects"] = total
         dst.attrs["redshift_edges"] = edges
         dst.attrs["skypatches"] = np.asarray(patches, dtype=np.int32)
         for name, source in columns.items():
             shape = (total,) + tuple(source.extra_shape)
-            chunks, kwargs = storage_opts(source.dtype, shape, compression, level)
-            dst.create_dataset(
-                name, shape=shape, dtype=source.dtype, chunks=chunks, **kwargs
-            )
+            dst.create_dataset(name, shape=shape, dtype=source.dtype)
         for name in ("skypatch", "source_core"):
-            chunks, kwargs = storage_opts(np.int32, (total,), compression, level)
-            dst.create_dataset(
-                name, shape=(total,), dtype=np.int32, chunks=chunks, **kwargs
-            )
+            dst.create_dataset(name, shape=(total,), dtype=np.int32)
         for name, values in grids.items():
-            chunks, kwargs = storage_opts(
-                values.dtype, values.shape, compression, level
-            )
-            dst.create_dataset(name, data=values, chunks=chunks, **kwargs)
+            dst.create_dataset(name, data=values)
         handles.append(dst)
     return handles
 
@@ -215,29 +205,84 @@ def patch_starts(patch_redshifts, edges):
     return starts, counts_by_patch
 
 
-def scatter(outputs, bins, cursors, names):
-    """Scatter a slab, advancing each bin cursor exactly once for this source."""
-    for b in np.unique(bins):
-        b = int(b)
-        mask = bins == b
-        lo = int(cursors[b])
-        hi = lo + int(mask.sum())
-        for name, values in names:
-            outputs[b][name][lo:hi] = values[mask]
-        cursors[b] = hi
+def write_patch(patch, raw_root, columns, edges, outputs, starts, counts_by_patch):
+    """Pass 2: place one skypatch's objects into their global redshift bins.
+
+    Each object is read once.  A single stable ``argsort`` of the bin index
+    permutes the patch into bin order, and every output dataset region is then
+    filled with one contiguous slab per bin -- one positioned write, no
+    per-core-group scatter.
+    """
+    n_bins = len(edges) - 1
+    catalog_path = patch_path(raw_root, patch, "lightcone_catalogs")
+    groups, sizes, _, _ = patch_offsets(catalog_path)
+
+    with h5py.File(catalog_path, "r") as catalog:
+        z = np.concatenate([catalog[group][REDSHIFT_KEY][:] for group in groups])
+
+    bins = assign_bins(z, edges)
+    # Stable so that, within a bin, objects keep their raw core-group order and
+    # every source file (which shares that order) permutes identically.
+    order = np.argsort(bins, kind="stable")
+    counts_pb = np.bincount(bins, minlength=n_bins).astype(np.int64)
+    if not np.array_equal(counts_pb, counts_by_patch[patch]):
+        raise AssertionError(
+            f"Patch {patch} bin counts changed between pass 1 and pass 2"
+        )
+    bin_ptr = np.empty(n_bins + 1, dtype=np.int64)
+    bin_ptr[0] = 0
+    np.cumsum(counts_pb, out=bin_ptr[1:])
+    base = starts[patch]
+
+    def emit(name, values):
+        for b in range(n_bins):
+            s, e = int(bin_ptr[b]), int(bin_ptr[b + 1])
+            if e == s:
+                continue
+            lo = int(base[b])
+            outputs[b][name][lo : lo + (e - s)] = values[order[s:e]]
+
+    emit("skypatch", np.full(z.shape[0], patch, dtype=np.int32))
+    emit(
+        "source_core",
+        np.concatenate(
+            [np.full(int(n), core_id(g), np.int32) for g, n in zip(groups, sizes)]
+        ),
+    )
+
+    with h5py.File(catalog_path, "r") as catalog:
+        for name, source in columns.items():
+            if source.kind != "lightcone_catalogs":
+                continue
+            column = np.concatenate(
+                [catalog[group][source.dataset][:] for group in groups]
+            )
+            emit(name, column)
+            del column
+
+    for kind in ("luminosities", "photometry"):
+        by_dataset = {}
+        for name, source in columns.items():
+            if source.kind == kind:
+                by_dataset.setdefault(source.dataset, []).append((name, source))
+        if not by_dataset:
+            continue
+        with h5py.File(patch_path(raw_root, patch, kind), "r") as flat:
+            for dataset_name, members in by_dataset.items():
+                full = flat[dataset_name][:]
+                for name, source in members:
+                    col = (
+                        full
+                        if source.col_index is None
+                        else full[:, source.col_index]
+                    )
+                    emit(name, col)
+                del full
+
+    return counts_pb
 
 
-def repartition(
-    raw_root,
-    out_dir,
-    n_partitions,
-    prefix,
-    decimals,
-    time_grids,
-    compression,
-    level,
-    chunk_cache_mb=256,
-):
+def repartition(raw_root, out_dir, n_partitions, prefix, decimals, time_grids):
     patches = discover_skypatches(raw_root)
     for patch in patches:
         validate_patch(raw_root, patch)
@@ -259,104 +304,23 @@ def repartition(
             )
     grids = load_time_grids(time_grids)
     print(f"\n  output columns: {len(columns)}")
-    set_blosc_threads(1)
-    outputs = create_outputs(
-        out_dir,
-        prefix,
-        edges,
-        counts,
-        columns,
-        grids,
-        patches,
-        compression,
-        level,
-        chunk_cache_mb,
-    )
-    final_cursors = np.zeros(len(counts), dtype=np.int64)
+
+    outputs = create_outputs(out_dir, prefix, edges, counts, columns, grids, patches)
+    written = np.zeros(len(counts), dtype=np.int64)
     try:
         for patch in patches:
             print(f"\nPass 2/2: patch {patch}")
-            catalog_path = patch_path(raw_root, patch, "lightcone_catalogs")
-            groups, sizes, offsets, _ = patch_offsets(catalog_path)
-
-            # The catalog pass also establishes provenance.  Every dataset is
-            # slabbed, including wide histories in large core groups.
-            for name, source in columns.items():
-                if source.kind != "lightcone_catalogs":
-                    continue
-                cursors = starts[patch].copy()
-                with h5py.File(catalog_path, "r") as catalog:
-                    for group in groups:
-                        dataset = catalog[group][source.dataset]
-                        bins = assign_bins(catalog[group][REDSHIFT_KEY][:], edges)
-                        values = dataset[:]
-                        scatter(outputs, bins, cursors, [(name, values)])
-                if not np.array_equal(cursors, starts[patch] + counts_by_patch[patch]):
-                    raise AssertionError(
-                        f"Catalog cursor mismatch for {name}, patch {patch}"
-                    )
-
-            cursors = starts[patch].copy()
-            with h5py.File(catalog_path, "r") as catalog:
-                for group in groups:
-                    dataset = catalog[group][REDSHIFT_KEY]
-                    bins = assign_bins(dataset[:], edges)
-                    values = np.full(len(dataset), patch, dtype=np.int32)
-                    cores = np.full(len(dataset), core_id(group), dtype=np.int32)
-                    scatter(
-                        outputs,
-                        bins,
-                        cursors,
-                        [("skypatch", values), ("source_core", cores)],
-                    )
-            if not np.array_equal(cursors, starts[patch] + counts_by_patch[patch]):
-                raise AssertionError(f"Provenance cursor mismatch for patch {patch}")
-            final_cursors += cursors - starts[patch]
-
-            for kind in ("luminosities", "photometry"):
-                path = patch_path(raw_root, patch, kind)
-                sources = {}
-                for name, source in columns.items():
-                    if source.kind == kind:
-                        sources.setdefault(source.dataset, []).append((name, source))
-                with (
-                    h5py.File(path, "r") as flat,
-                    h5py.File(catalog_path, "r") as catalog,
-                ):
-                    for dataset_name, names in sources.items():
-                        dataset = flat[dataset_name]
-                        cursors = starts[patch].copy()
-                        for group, size, offset in zip(groups, sizes, offsets):
-                            z = catalog[group][REDSHIFT_KEY]
-                            bins = assign_bins(z[:], edges)
-                            slab = dataset[int(offset) : int(offset) + len(z)]
-                            values = [
-                                (
-                                    name,
-                                    slab
-                                    if source.col_index is None
-                                    else slab[:, source.col_index],
-                                )
-                                for name, source in names
-                            ]
-                            scatter(outputs, bins, cursors, values)
-                        if not np.array_equal(
-                            cursors, starts[patch] + counts_by_patch[patch]
-                        ):
-                            raise AssertionError(
-                                f"Flat cursor mismatch for {dataset_name}, patch {patch}"
-                            )
+            written += write_patch(
+                patch, raw_root, columns, edges, outputs, starts, counts_by_patch
+            )
             print(f"  patch {patch}: columns written")
     finally:
         for dst in outputs:
             dst.close()
 
     expected = np.asarray(counts, dtype=np.int64)
-    # Provenance is written once per object and follows the same reservations
-    # as every data column, so these are the actual final output cursors.
-    cursors = final_cursors
-    if not np.array_equal(cursors, expected):
-        sys.exit(f"Row count mismatch!\n  expected: {expected}\n  written:  {cursors}")
+    if not np.array_equal(written, expected):
+        sys.exit(f"Row count mismatch!\n  expected: {expected}\n  written:  {written}")
     print(
         f"\nDone. {int(expected.sum()):,} objects across {len(outputs)} partition(s) in {out_dir!r}"
     )
@@ -391,16 +355,6 @@ def main():
         help="decimal places for redshift bounds (default: 2)",
     )
     parser.add_argument(
-        "--chunk-cache-mb",
-        type=int,
-        default=256,
-        help=(
-            "HDF5 raw chunk cache per output file in MB (default: 256); total cache is "
-            "chunk_cache_mb * n_partitions (defaults: 16 * 256 MB = 4 GB), the "
-            "dominant memory cost of this stage"
-        ),
-    )
-    parser.add_argument(
         "--time-grids", default=DEFAULT_TIME_GRIDS, help="path to time_grids.npz"
     )
     parser.add_argument(
@@ -408,12 +362,9 @@ def main():
         action="store_true",
         help="verify raw alignment without writing outputs",
     )
-    add_compression_args(parser)
     args = parser.parse_args()
     if args.n_partitions < 1:
         sys.exit("--n-partitions must be >= 1")
-    if args.chunk_cache_mb < 1:
-        sys.exit("--chunk-cache-mb must be >= 1")
     try:
         if args.verify:
             verify(args.raw_root)
@@ -425,9 +376,6 @@ def main():
                 args.prefix,
                 args.decimals,
                 args.time_grids,
-                args.compression,
-                args.compression_level,
-                args.chunk_cache_mb,
             )
     except RawLayoutError as exc:
         sys.exit(f"Raw layout error: {exc}")
