@@ -21,8 +21,11 @@ copy from the source slab to its reserved span in the output file.
 """
 
 import argparse
+import math
 import os
 import sys
+from concurrent.futures import ProcessPoolExecutor
+from multiprocessing import shared_memory
 
 import h5py
 import numpy as np
@@ -205,17 +208,124 @@ def patch_starts(patch_redshifts, edges):
     return starts, counts_by_patch
 
 
-def write_patch(patch, raw_root, columns, edges, outputs, starts, counts_by_patch):
+# --- Parallel decompression -------------------------------------------------
+#
+# gzip inflate is CPU-bound and single-threaded, and h5py serialises every HDF5
+# call behind one global lock, so a *thread* pool gives no speedup (measured:
+# 0%).  The reads below are therefore fanned out across worker *processes*, each
+# with its own read-only file handle, decompressing disjoint row ranges straight
+# into a shared-memory buffer the parent owns.  No decompressed array is ever
+# pickled back -- the workers return only a row count.
+
+_OPEN_FILES = {}
+
+
+def _worker_file(path):
+    """Return a per-worker cached read-only handle for ``path``.
+
+    Workers persist across tasks, so caching turns thousands of opens of a large
+    catalog into one per worker.  Read-only handles are never shared across
+    processes, so this is safe.
+    """
+    handle = _OPEN_FILES.get(path)
+    if handle is None:
+        handle = h5py.File(path, "r")
+        _OPEN_FILES[path] = handle
+    return handle
+
+
+def _gather_worker(args):
+    """Decompress one source row range into its slot in the shared buffer."""
+    path, h5path, src_lo, src_hi, dst_lo, shm_name, shape, dtype_str = args
+    shm = shared_memory.SharedMemory(name=shm_name)
+    try:
+        buf = np.ndarray(shape, dtype=np.dtype(dtype_str), buffer=shm.buf)
+        buf[dst_lo : dst_lo + (src_hi - src_lo)] = _worker_file(path)[h5path][
+            src_lo:src_hi
+        ]
+    finally:
+        shm.close()
+    return src_hi - src_lo
+
+
+def _chunk_aligned_spans(handle, sources, n_total, processes):
+    """Split ``sources`` into ~``4*processes`` chunk-aligned work pieces.
+
+    ``sources`` is a list of ``(h5path, n_rows, dst_offset)``.  Splitting inside
+    the large core groups (the biggest is ~10% of the catalog) is what lets the
+    pool balance past ~10x; aligning every boundary to the dataset's chunk rows
+    keeps each gzip chunk owned by exactly one worker, so none is inflated twice.
+    """
+    target = max(1, math.ceil(n_total / max(1, 4 * processes)))
+    items = []
+    for h5path, n_rows, dst_off in sources:
+        if n_rows <= 0:
+            continue
+        chunks = handle[h5path].chunks
+        chunk_rows = chunks[0] if chunks else n_rows
+        step = max(chunk_rows, (target // chunk_rows) * chunk_rows or chunk_rows)
+        for lo in range(0, n_rows, step):
+            hi = min(lo + step, n_rows)
+            items.append((h5path, lo, hi, dst_off + lo))
+    return items
+
+
+def gather(pool, processes, path, sources, shape, dtype):
+    """Parallel-decompress ``sources`` into one array of ``shape``.
+
+    Returns ``(array, close)``.  ``array`` is backed by shared memory when a pool
+    is supplied; ``close()`` releases it and must be called once the caller has
+    finished reading (drop the array reference first).  With ``pool is None`` the
+    read runs serially in-process and ``close`` is a no-op.
+    """
+    dtype = np.dtype(dtype)
+    nbytes = int(np.prod(shape, dtype=np.int64)) * dtype.itemsize
+
+    if pool is None or nbytes == 0:
+        array = np.empty(shape, dtype=dtype)
+        with h5py.File(path, "r") as handle:
+            for h5path, n_rows, dst_off in sources:
+                if n_rows:
+                    array[dst_off : dst_off + n_rows] = handle[h5path][:n_rows]
+        return array, (lambda: None)
+
+    shm = shared_memory.SharedMemory(create=True, size=nbytes)
+    try:
+        array = np.ndarray(shape, dtype=dtype, buffer=shm.buf)
+        with h5py.File(path, "r") as handle:
+            spans = _chunk_aligned_spans(handle, sources, shape[0], processes)
+        work = [
+            (path, h5path, lo, hi, dst, shm.name, shape, dtype.str)
+            for (h5path, lo, hi, dst) in spans
+        ]
+        for _ in pool.map(_gather_worker, work):
+            pass
+    except BaseException:
+        shm.close()
+        shm.unlink()
+        raise
+
+    def close():
+        shm.close()
+        shm.unlink()
+
+    return array, close
+
+
+def write_patch(
+    patch, raw_root, columns, edges, outputs, starts, counts_by_patch, pool, processes
+):
     """Pass 2: place one skypatch's objects into their global redshift bins.
 
     Each object is read once.  A single stable ``argsort`` of the bin index
     permutes the patch into bin order, and every output dataset region is then
     filled with one contiguous slab per bin -- one positioned write, no
-    per-core-group scatter.
+    per-core-group scatter.  The per-column reads are decompressed in parallel by
+    ``gather`` (see above); the permute-and-write stays in this process.
     """
     n_bins = len(edges) - 1
     catalog_path = patch_path(raw_root, patch, "lightcone_catalogs")
-    groups, sizes, _, _ = patch_offsets(catalog_path)
+    groups, sizes, offsets, n_total = patch_offsets(catalog_path)
 
     with h5py.File(catalog_path, "r") as catalog:
         z = np.concatenate([catalog[group][REDSHIFT_KEY][:] for group in groups])
@@ -250,39 +360,67 @@ def write_patch(patch, raw_root, columns, edges, outputs, starts, counts_by_patc
         ),
     )
 
-    with h5py.File(catalog_path, "r") as catalog:
-        for name, source in columns.items():
-            if source.kind != "lightcone_catalogs":
-                continue
-            column = np.concatenate(
-                [catalog[group][source.dataset][:] for group in groups]
-            )
-            emit(name, column)
-            del column
-
-    for kind in ("luminosities", "photometry"):
-        by_dataset = {}
-        for name, source in columns.items():
-            if source.kind == kind:
-                by_dataset.setdefault(source.dataset, []).append((name, source))
-        if not by_dataset:
+    for name, source in columns.items():
+        if source.kind != "lightcone_catalogs":
             continue
-        with h5py.File(patch_path(raw_root, patch, kind), "r") as flat:
-            for dataset_name, members in by_dataset.items():
+        # One shared-memory slot per group, at that group's flat-file offset.
+        sources = [
+            (f"{group}/{source.dataset}", int(size), int(offset))
+            for group, size, offset in zip(groups, sizes, offsets)
+        ]
+        shape = (n_total,) + tuple(source.extra_shape)
+        column, close = gather(pool, processes, catalog_path, sources, shape, source.dtype)
+        try:
+            emit(name, column)
+        finally:
+            del column
+            close()
+
+    # Luminosities are stored uncompressed and contiguous, so decompression is
+    # not the cost there; read them serially.  Photometry is gzip-compressed and
+    # large, so its single flat dataset is split by chunk-aligned row range.
+    lum_by_dataset = {}
+    for name, source in columns.items():
+        if source.kind == "luminosities":
+            lum_by_dataset.setdefault(source.dataset, []).append((name, source))
+    if lum_by_dataset:
+        with h5py.File(patch_path(raw_root, patch, "luminosities"), "r") as flat:
+            for dataset_name, members in lum_by_dataset.items():
                 full = flat[dataset_name][:]
                 for name, source in members:
-                    col = (
-                        full
-                        if source.col_index is None
-                        else full[:, source.col_index]
-                    )
+                    col = full if source.col_index is None else full[:, source.col_index]
                     emit(name, col)
                 del full
+
+    phot_by_dataset = {}
+    for name, source in columns.items():
+        if source.kind == "photometry":
+            phot_by_dataset.setdefault(source.dataset, []).append((name, source))
+    if phot_by_dataset:
+        phot_path = patch_path(raw_root, patch, "photometry")
+        with h5py.File(phot_path, "r") as flat:
+            widths = {ds: flat[ds].shape[1] for ds in phot_by_dataset}
+            dtypes = {ds: flat[ds].dtype for ds in phot_by_dataset}
+        for dataset_name, members in phot_by_dataset.items():
+            shape = (n_total, widths[dataset_name])
+            full, close = gather(
+                pool, processes, phot_path,
+                [(dataset_name, n_total, 0)], shape, dtypes[dataset_name],
+            )
+            try:
+                for name, source in members:
+                    col = full if source.col_index is None else full[:, source.col_index]
+                    emit(name, col)
+            finally:
+                del full
+                close()
 
     return counts_pb
 
 
-def repartition(raw_root, out_dir, n_partitions, prefix, decimals, time_grids):
+def repartition(
+    raw_root, out_dir, n_partitions, prefix, decimals, time_grids, processes
+):
     patches = discover_skypatches(raw_root)
     for patch in patches:
         validate_patch(raw_root, patch)
@@ -307,14 +445,19 @@ def repartition(raw_root, out_dir, n_partitions, prefix, decimals, time_grids):
 
     outputs = create_outputs(out_dir, prefix, edges, counts, columns, grids, patches)
     written = np.zeros(len(counts), dtype=np.int64)
+    pool = ProcessPoolExecutor(max_workers=processes) if processes > 1 else None
+    print(f"  decompression workers: {processes}")
     try:
         for patch in patches:
             print(f"\nPass 2/2: patch {patch}")
             written += write_patch(
-                patch, raw_root, columns, edges, outputs, starts, counts_by_patch
+                patch, raw_root, columns, edges, outputs, starts, counts_by_patch,
+                pool, processes,
             )
             print(f"  patch {patch}: columns written")
     finally:
+        if pool is not None:
+            pool.shutdown()
         for dst in outputs:
             dst.close()
 
@@ -358,6 +501,13 @@ def main():
         "--time-grids", default=DEFAULT_TIME_GRIDS, help="path to time_grids.npz"
     )
     parser.add_argument(
+        "--processes",
+        type=int,
+        default=os.cpu_count() or 1,
+        help="worker processes for parallel decompression (default: all cores; "
+        "1 disables the pool and reads serially)",
+    )
+    parser.add_argument(
         "--verify",
         action="store_true",
         help="verify raw alignment without writing outputs",
@@ -365,6 +515,8 @@ def main():
     args = parser.parse_args()
     if args.n_partitions < 1:
         sys.exit("--n-partitions must be >= 1")
+    if args.processes < 1:
+        sys.exit("--processes must be >= 1")
     try:
         if args.verify:
             verify(args.raw_root)
@@ -376,6 +528,7 @@ def main():
                 args.prefix,
                 args.decimals,
                 args.time_grids,
+                args.processes,
             )
     except RawLayoutError as exc:
         sys.exit(f"Raw layout error: {exc}")

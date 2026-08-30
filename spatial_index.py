@@ -30,6 +30,19 @@ through unchanged at the root, and the root attributes are preserved.  The
 header group that a complete OpenCosmo file also needs is deliberately out of
 scope here.
 
+Storage
+-------
+This stage writes the final artefact, so it is compressed -- but selectively.
+Columns that compress well (the 2-D history arrays; small-range integers like
+the flags, states and provenance ids) get Blosc/zstd-5.  Continuous 1-D floats
+(``ra``/``dec``/``redshift``, positions, velocities, magnitudes) and
+high-cardinality identifier integers compress only ~1.1-1.3x, so they are
+stored contiguous and unfiltered, which also makes an index-driven slice read a
+single seek.  Chunks are sized small (``--chunk-kib``, default 1 MiB
+uncompressed) because the smallest expected read is a narrow sky cone;
+compression ratio is nearly insensitive to chunk volume (PLAN 4.3).
+Reading the Blosc columns back requires ``hdf5plugin``.
+
 Usage
 -----
     python spatial_index.py --level 5
