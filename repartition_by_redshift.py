@@ -31,11 +31,9 @@ import h5py
 import numpy as np
 
 from supermock_raw import (
-    DEFAULT_TIME_GRIDS,
     RawLayoutError,
     core_groups,
     discover_skypatches,
-    load_time_grids,
     open_output,
     patch_offsets,
     patch_path,
@@ -161,7 +159,7 @@ def gather_redshifts(raw_root, patches):
     return np.concatenate(chunks), patch_counts
 
 
-def create_outputs(out_dir, prefix, edges, counts, columns, grids, patches):
+def create_outputs(out_dir, prefix, edges, counts, columns, patches):
     """Create pre-sized output files with uncompressed, contiguous datasets.
 
     Contiguous layout means every dataset occupies one flat run of bytes, so a
@@ -189,8 +187,6 @@ def create_outputs(out_dir, prefix, edges, counts, columns, grids, patches):
             dst.create_dataset(name, shape=shape, dtype=source.dtype)
         for name in ("skypatch", "source_core"):
             dst.create_dataset(name, shape=(total,), dtype=np.int32)
-        for name, values in grids.items():
-            dst.create_dataset(name, data=values)
         handles.append(dst)
     return handles
 
@@ -369,7 +365,9 @@ def write_patch(
             for group, size, offset in zip(groups, sizes, offsets)
         ]
         shape = (n_total,) + tuple(source.extra_shape)
-        column, close = gather(pool, processes, catalog_path, sources, shape, source.dtype)
+        column, close = gather(
+            pool, processes, catalog_path, sources, shape, source.dtype
+        )
         try:
             emit(name, column)
         finally:
@@ -388,7 +386,9 @@ def write_patch(
             for dataset_name, members in lum_by_dataset.items():
                 full = flat[dataset_name][:]
                 for name, source in members:
-                    col = full if source.col_index is None else full[:, source.col_index]
+                    col = (
+                        full if source.col_index is None else full[:, source.col_index]
+                    )
                     emit(name, col)
                 del full
 
@@ -404,12 +404,18 @@ def write_patch(
         for dataset_name, members in phot_by_dataset.items():
             shape = (n_total, widths[dataset_name])
             full, close = gather(
-                pool, processes, phot_path,
-                [(dataset_name, n_total, 0)], shape, dtypes[dataset_name],
+                pool,
+                processes,
+                phot_path,
+                [(dataset_name, n_total, 0)],
+                shape,
+                dtypes[dataset_name],
             )
             try:
                 for name, source in members:
-                    col = full if source.col_index is None else full[:, source.col_index]
+                    col = (
+                        full if source.col_index is None else full[:, source.col_index]
+                    )
                     emit(name, col)
             finally:
                 del full
@@ -418,9 +424,7 @@ def write_patch(
     return counts_pb
 
 
-def repartition(
-    raw_root, out_dir, n_partitions, prefix, decimals, time_grids, processes
-):
+def repartition(raw_root, out_dir, n_partitions, prefix, decimals, processes):
     patches = discover_skypatches(raw_root)
     for patch in patches:
         validate_patch(raw_root, patch)
@@ -440,10 +444,9 @@ def repartition(
             raise RawLayoutError(
                 f"Patch {patch} has a different resolved column layout"
             )
-    grids = load_time_grids(time_grids)
     print(f"\n  output columns: {len(columns)}")
 
-    outputs = create_outputs(out_dir, prefix, edges, counts, columns, grids, patches)
+    outputs = create_outputs(out_dir, prefix, edges, counts, columns, patches)
     written = np.zeros(len(counts), dtype=np.int64)
     pool = ProcessPoolExecutor(max_workers=processes) if processes > 1 else None
     print(f"  decompression workers: {processes}")
@@ -451,8 +454,15 @@ def repartition(
         for patch in patches:
             print(f"\nPass 2/2: patch {patch}")
             written += write_patch(
-                patch, raw_root, columns, edges, outputs, starts, counts_by_patch,
-                pool, processes,
+                patch,
+                raw_root,
+                columns,
+                edges,
+                outputs,
+                starts,
+                counts_by_patch,
+                pool,
+                processes,
             )
             print(f"  patch {patch}: columns written")
     finally:
@@ -498,9 +508,6 @@ def main():
         help="decimal places for redshift bounds (default: 2)",
     )
     parser.add_argument(
-        "--time-grids", default=DEFAULT_TIME_GRIDS, help="path to time_grids.npz"
-    )
-    parser.add_argument(
         "--processes",
         type=int,
         default=os.cpu_count() or 1,
@@ -527,7 +534,6 @@ def main():
                 args.n_partitions,
                 args.prefix,
                 args.decimals,
-                args.time_grids,
                 args.processes,
             )
     except RawLayoutError as exc:
