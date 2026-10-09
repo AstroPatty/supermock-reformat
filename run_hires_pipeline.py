@@ -5,7 +5,7 @@ import shutil
 
 import click
 
-from append_hires_seds import SedSources, append_one
+from append_hires_seds import DEFAULT_BLOCK_MIB, DEFAULT_CHUNK_ROWS, SED_CODECS, SedSources, append_one
 from repartition_by_redshift import repartition
 from spatial_index import OutputPolicy, run as spatial_run
 from supermock_raw import RawLayoutError, set_blosc_threads
@@ -61,8 +61,16 @@ def _final_paths(directory):
 @click.option("--decimals", type=click.IntRange(0, None), default=2, show_default=True)
 @click.option("--spatial-level", type=click.IntRange(0, None), default=5, show_default=True)
 @click.option("--processes", type=click.IntRange(1, None), default=1, show_default=True,
-              help="Catalog/spatial worker processes. SED append remains one bounded-memory writer.")
-@click.option("--sed-block-mib", type=click.IntRange(1, None), default=512, show_default=True)
+              help="Worker processes for catalog stages and for the SED gather.")
+@click.option("--sed-block-mib", type=click.IntRange(1, None), default=DEFAULT_BLOCK_MIB, show_default=True,
+              help="Uncompressed MiB per raw SED read slab and per SED output write.")
+@click.option("--sed-chunk-rows", type=click.IntRange(1, None), default=DEFAULT_CHUNK_ROWS, show_default=True,
+              help="Rows per /data/SED chunk; small chunks keep single-galaxy reads cheap.")
+@click.option("--sed-compression", type=click.Choice(SED_CODECS), default="blosc-lz4", show_default=True,
+              help="Codec for /data/SED (byte-shuffled); independent of --compression.")
+@click.option("--sed-compression-level", type=int, default=5, show_default=True)
+@click.option("--sed-buffer-dir", type=click.Path(file_okay=False, resolve_path=True),
+              help="Where to hold one uncompressed redshift slice of SEDs; default /dev/shm, else --scratch-dir.")
 @click.option("--spatial-block-rows", type=click.IntRange(1, None), default=None,
               help="Rows per spatial output write; default follows each output chunk.")
 @click.option("--compression", type=click.Choice(["blosc", "gzip", "lzf", "none"]), default="blosc", show_default=True)
@@ -72,7 +80,8 @@ def _final_paths(directory):
               help="Keep/remove scratch repartitioned files after success.")
 def main(catalog_dir, luminosity_dir, photometry_dir, sed_dir, header_source, output_dir, scratch_dir,
          patches, n_partitions, prefix, decimals, spatial_level, processes,
-         sed_block_mib, spatial_block_rows, compression, compression_level,
+         sed_block_mib, sed_chunk_rows, sed_compression, sed_compression_level, sed_buffer_dir,
+         spatial_block_rows, compression, compression_level,
          overwrite, keep_intermediates):
     """Build final spatial OpenCosmo catalogs, optionally appending hi-res SEDs."""
     run_dir = os.path.join(scratch_dir, "supermock_hires_pipeline")
@@ -121,11 +130,13 @@ def main(catalog_dir, luminosity_dir, photometry_dir, sed_dir, header_source, ou
                     skypatch = handle["data/skypatch"]
                     for lo in range(0, skypatch.shape[0], 1 << 20):
                         source_patches.update(map(int, np.unique(skypatch[lo:lo + (1 << 20)])))
-            click.echo(f"Stage 3/{stage_count}: appending hi-res SEDs in bounded row blocks")
+            click.echo(f"Stage 3/{stage_count}: gathering and appending hi-res SEDs")
             sources = SedSources(sed_dir, sorted(source_patches))
             try:
                 for path in paths:
-                    append_one(path, sources, sed_block_mib, compression, compression_level,
+                    append_one(path, sources, codec=sed_compression, level=sed_compression_level,
+                               chunk_rows=sed_chunk_rows, block_mib=sed_block_mib, processes=processes,
+                               buffer_dir=sed_buffer_dir, scratch_dir=run_dir,
                                overwrite=True, verify_samples=16)
             finally:
                 sources.close()
