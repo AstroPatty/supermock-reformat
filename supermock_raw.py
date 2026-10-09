@@ -33,6 +33,10 @@ _TIME_GRIDS_PATH = os.path.join(
 )
 
 ColumnSource = namedtuple("ColumnSource", "kind dataset col_index dtype extra_shape")
+SedShard = namedtuple(
+    "SedShard",
+    "path patch shard nshards row_offset n_rows n_global width block_size",
+)
 
 
 class RawLayoutError(RuntimeError):
@@ -109,6 +113,64 @@ def discover_skypatches(root):
         pairs = ", ".join(f"({patch}, {kind})" for patch, kind in missing)
         raise RawLayoutError(f"Raw skypatch files are incomplete; missing: {pairs}")
     return sorted(union)
+
+
+def discover_sed_shards(root, patch=None):
+    """Discover and validate complete hi-res SED shard sets.
+
+    SEDs are separate from ``KINDS`` because each patch is split across many
+    files.  Only metadata is read here; incomplete sets are always rejected.
+    """
+    pattern = os.path.join(os.fspath(root), "seds_skypatch_*.shard*of*.h5")
+    name_re = re.compile(r"seds_skypatch_(\d+)\.shard(\d+)of(\d+)\.h5")
+    found = {}
+    for path in glob(pattern):
+        match = name_re.fullmatch(os.path.basename(path))
+        if not match:
+            continue
+        file_patch, shard, declared_nshards = map(int, match.groups())
+        if patch is not None and file_patch != int(patch):
+            continue
+        with h5py.File(path, "r") as handle:
+            missing = [name for name in ("SED", "core_tag", "redshift", "wave_rest") if name not in handle]
+            if missing:
+                raise RawLayoutError(f"SED shard {path} is missing datasets: {missing}")
+            sed = handle["SED"]
+            if sed.ndim != 2:
+                raise RawLayoutError(f"SED shard {path} has shape {sed.shape}; expected 2-D")
+            n_rows, width = sed.shape
+            if handle["core_tag"].shape != (n_rows,) or handle["redshift"].shape != (n_rows,):
+                raise RawLayoutError(f"SED shard {path} has non-row-aligned identity datasets")
+            attrs = handle.attrs
+            for name in ("shard", "nshards", "row_offset", "n_global", "complete"):
+                if name not in attrs:
+                    raise RawLayoutError(f"SED shard {path} is missing attribute {name!r}")
+            if not bool(attrs["complete"]):
+                raise RawLayoutError(f"SED shard {path} is not complete")
+            if int(attrs["shard"]) != shard or int(attrs["nshards"]) != declared_nshards:
+                raise RawLayoutError(f"SED shard filename and metadata disagree: {path}")
+            found.setdefault(file_patch, []).append(SedShard(
+                path, file_patch, shard, declared_nshards, int(attrs["row_offset"]),
+                n_rows, int(attrs["n_global"]), width, int(attrs.get("block_size", 0)),
+            ))
+    if not found:
+        suffix = f" for patch {patch}" if patch is not None else ""
+        raise RawLayoutError(f"No hi-res SED shards found under {root!r}{suffix}")
+    for file_patch, shards in found.items():
+        shards.sort(key=lambda item: item.shard)
+        first = shards[0]
+        if len(shards) != first.nshards or [item.shard for item in shards] != list(range(first.nshards)):
+            raise RawLayoutError(f"SED patch {file_patch} has {len(shards)} of {first.nshards} shards; refusing partial conversion")
+        if any((item.nshards, item.n_global, item.width) != (first.nshards, first.n_global, first.width) for item in shards):
+            raise RawLayoutError(f"SED patch {file_patch} has inconsistent shard metadata")
+        next_offset = 0
+        for item in sorted(shards, key=lambda value: value.row_offset):
+            if item.row_offset != next_offset:
+                raise RawLayoutError(f"SED patch {file_patch} has non-contiguous shard row ranges")
+            next_offset += item.n_rows
+        if next_offset != first.n_global:
+            raise RawLayoutError(f"SED patch {file_patch} covers {next_offset:,} rows; metadata declares {first.n_global:,}")
+    return {key: found[key] for key in sorted(found)}
 
 
 def _with_catalog(path_or_handle, callback):

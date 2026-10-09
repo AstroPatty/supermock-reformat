@@ -103,9 +103,21 @@ def core_id(group):
         raise RawLayoutError(f"Unexpected catalog core group name: {group!r}") from exc
 
 
-def verify(raw_root):
+def _selected_patches(raw_root, patches):
+    """Return requested patches after checking they exist in every raw kind."""
+    available = discover_skypatches(raw_root)
+    if patches is None:
+        return available
+    selected = sorted(set(map(int, patches)))
+    missing = sorted(set(selected) - set(available))
+    if missing:
+        raise RawLayoutError(f"Requested skypatches are unavailable: {missing}")
+    return selected
+
+
+def verify(raw_root, patches=None):
     """Check the cheap scalar invariants that establish raw-file alignment."""
-    patches = discover_skypatches(raw_root)
+    patches = _selected_patches(raw_root, patches)
     print(f"Skypatch parity: PASS ({', '.join(map(str, patches))})")
     passed = failed = 0
     for patch in patches:
@@ -182,11 +194,16 @@ def create_outputs(out_dir, prefix, edges, counts, columns, patches):
         dst.attrs["n_objects"] = total
         dst.attrs["redshift_edges"] = edges
         dst.attrs["skypatches"] = np.asarray(patches, dtype=np.int32)
+        dst.attrs["source_global_row_scope"] = "within source skypatch"
+        dst.attrs["source_row_order"] = (
+            "producer flat row order: lexicographically sorted core groups"
+        )
         for name, source in columns.items():
             shape = (total,) + tuple(source.extra_shape)
             dst.create_dataset(name, shape=shape, dtype=source.dtype)
         for name in ("skypatch", "source_core"):
             dst.create_dataset(name, shape=(total,), dtype=np.int32)
+        dst.create_dataset("source_global_row", shape=(total,), dtype=np.int64)
         handles.append(dst)
     return handles
 
@@ -349,6 +366,10 @@ def write_patch(
             outputs[b][name][lo : lo + (e - s)] = values[order[s:e]]
 
     emit("skypatch", np.full(z.shape[0], patch, dtype=np.int32))
+    # This is the join key for very large auxiliary products (notably hi-res
+    # SEDs).  It is the row in the producer's flat, lexicographic-core stream,
+    # not a core id or a row in the redshift-partitioned output.
+    emit("source_global_row", np.arange(n_total, dtype=np.int64))
     emit(
         "source_core",
         np.concatenate(
@@ -424,8 +445,8 @@ def write_patch(
     return counts_pb
 
 
-def repartition(raw_root, out_dir, n_partitions, prefix, decimals, processes):
-    patches = discover_skypatches(raw_root)
+def repartition(raw_root, out_dir, n_partitions, prefix, decimals, processes, patches=None):
+    patches = _selected_patches(raw_root, patches)
     for patch in patches:
         validate_patch(raw_root, patch)
 

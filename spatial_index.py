@@ -133,6 +133,7 @@ DESCRIPTIONS = {
     "core_state": "Current state of the galaxy core",
     "core_state_history": "History of galaxy core states",
     "skypatch": "Source skypatch identifier",
+    "source_global_row": "Producer flat row within the source skypatch",
     "source_core": "Source core identifier within the skypatch",
     "t25_a1": "Scale factor when 25 percent of the peak mass was assembled",
     "t50_a1": "Scale factor when 50 percent of the peak mass was assembled",
@@ -291,6 +292,23 @@ def reorder_file(in_path, out_path, level, block_rows, progress, policy):
                 )
         if progress:
             print("\r" + " " * 60 + "\r", end="")
+
+        # Persist the exact reorder operation alongside the final catalog.  In
+        # particular, this makes the final row -> raw SED row join auditable
+        # even after the redshift-partitioned intermediates have been removed.
+        provenance = dst.create_group("provenance")
+        input_for_output = provenance.create_dataset(
+            "input_row_for_output_row", shape=(n,), dtype=np.int64
+        )
+        step = block_rows or (16 << 20)
+        for lo in range(0, n, step):
+            hi = min(lo + step, n)
+            input_for_output[lo:hi] = order[lo:hi]
+        provenance.attrs["permutation_semantics"] = (
+            "input_row_for_output_row[final_spatial_row] = repartitioned_input_row"
+        )
+        provenance.attrs["input_row_order"] = "redshift partition order"
+        provenance.attrs["output_row_order"] = "nested HEALPix pixel, stable input order"
 
         index = dst.create_group("index")
         index.attrs["index_type"] = "healpix"
