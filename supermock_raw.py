@@ -10,6 +10,7 @@ incompatible assumptions about that alignment.
 import json
 import os
 import re
+import time
 from collections import namedtuple
 from glob import glob
 
@@ -41,6 +42,43 @@ SedShard = namedtuple(
 
 class RawLayoutError(RuntimeError):
     """The raw files do not have the layout required for safe row alignment."""
+
+
+class Progress:
+    """Print full-line progress updates at most every ``interval`` seconds.
+
+    Each update is its own line (no carriage returns or progress bars), so the
+    output stays readable in an HPC job log where stdout is redirected to a
+    file.  The first and last calls always print.
+    """
+
+    def __init__(self, label, total, interval=30.0):
+        self.label = label
+        self.total = total
+        self.interval = interval
+        self.start = time.monotonic()
+        self.last = 0.0
+
+    def update(self, done, force=False):
+        now = time.monotonic()
+        if not force and done < self.total and now - self.last < self.interval:
+            return
+        self.last = now
+        elapsed = now - self.start
+        if self.total:
+            pct = 100.0 * done / self.total
+            rate = done / elapsed if elapsed > 0 else 0.0
+            eta = (self.total - done) / rate if rate > 0 else 0.0
+            print(
+                f"  {self.label}: {done:,}/{self.total:,} ({pct:5.1f}%) "
+                f"elapsed {elapsed:,.0f}s eta {eta:,.0f}s",
+                flush=True,
+            )
+        else:
+            print(f"  {self.label}: {done:,} elapsed {elapsed:,.0f}s", flush=True)
+
+    def done(self, done=None):
+        self.update(self.total if done is None else done, force=True)
 
 
 def _module_raw_path(relative):

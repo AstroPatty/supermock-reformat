@@ -31,6 +31,7 @@ import h5py
 import numpy as np
 
 from supermock_raw import (
+    Progress,
     RawLayoutError,
     core_groups,
     discover_skypatches,
@@ -377,6 +378,9 @@ def write_patch(
         ),
     )
 
+    progress = Progress(f"patch {patch} columns", len(columns))
+    written_columns = 0
+
     for name, source in columns.items():
         if source.kind != "lightcone_catalogs":
             continue
@@ -394,6 +398,8 @@ def write_patch(
         finally:
             del column
             close()
+        written_columns += 1
+        progress.update(written_columns)
 
     # Luminosities are stored uncompressed and contiguous, so decompression is
     # not the cost there; read them serially.  Photometry is gzip-compressed and
@@ -411,6 +417,8 @@ def write_patch(
                         full if source.col_index is None else full[:, source.col_index]
                     )
                     emit(name, col)
+                    written_columns += 1
+                    progress.update(written_columns)
                 del full
 
     phot_by_dataset = {}
@@ -438,10 +446,13 @@ def write_patch(
                         full if source.col_index is None else full[:, source.col_index]
                     )
                     emit(name, col)
+                    written_columns += 1
+                    progress.update(written_columns)
             finally:
                 del full
                 close()
 
+    progress.done(written_columns)
     return counts_pb
 
 

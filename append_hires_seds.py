@@ -14,7 +14,7 @@ import sys
 import h5py
 import numpy as np
 
-from supermock_raw import RawLayoutError, add_compression_args, discover_sed_shards, storage_opts
+from supermock_raw import Progress, RawLayoutError, add_compression_args, discover_sed_shards, storage_opts
 
 
 def _output_paths(paths, directory):
@@ -150,6 +150,7 @@ def append_one(path, sources, block_mib, compression, level, overwrite, verify_s
         sed.attrs["source_identity"] = "(skypatch, source_global_row)"
         data.attrs["sed_append_complete"] = False
 
+        progress = Progress(f"SED rows ({os.path.basename(path)})", n_rows)
         for lo in range(0, n_rows, block_rows):
             hi = min(lo + block_rows, n_rows)
             patches = data["skypatch"][lo:hi]
@@ -161,6 +162,8 @@ def append_one(path, sources, block_mib, compression, level, overwrite, verify_s
                     raise RawLayoutError(f"{path} references SED patch {int(patch)}, which was not supplied")
                 values[positions] = sources.read(int(patch), source_rows[positions])
             sed[lo:hi] = values
+            progress.update(hi)
+        progress.done()
 
         # Validate identity data without re-reading spectra.  The catalog fields
         # have already undergone the identical redshift/spatial permutations.

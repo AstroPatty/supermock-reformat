@@ -69,6 +69,7 @@ import healpy as hp
 import numpy as np
 
 from supermock_raw import (
+    Progress,
     add_compression_args,
     open_output,
     set_blosc_threads,
@@ -222,9 +223,11 @@ def occupancy(levels, level):
 def reorder_file(in_path, out_path, level, block_rows, progress, policy):
     """Rewrite one file, sorted by HEALPix pixel.  Returns lines to log.
 
-    Nothing here prints directly except the transient progress line: with
-    several workers running, interleaved partial output would be unreadable,
-    so messages are returned and printed by the parent once the file is done.
+    Nothing here prints directly except the per-column progress, which only runs
+    in the serial in-process path (``progress`` is ``"tty"`` for an overwriting
+    single line or ``"line"`` for time-throttled full lines in a redirected log).
+    Worker processes pass a falsy ``progress`` so their output stays interleave-
+    free: their messages are returned and printed by the parent once done.
     """
     log = []
     with (
@@ -255,6 +258,11 @@ def reorder_file(in_path, out_path, level, block_rows, progress, policy):
         dst.attrs["spatial_index_nside"] = 2**level
 
         data = dst.create_group("data")
+        column_progress = (
+            Progress(f"{os.path.basename(in_path)} columns", len(columns))
+            if progress == "line"
+            else None
+        )
         for i, name in enumerate(columns, 1):
             ref = src[name]
             # Whole column into RAM: one sequential read, RAM-speed permute, one
@@ -284,14 +292,18 @@ def reorder_file(in_path, out_path, level, block_rows, progress, policy):
                 out[lo:hi] = values[order[lo:hi]]
             del values
 
-            if progress:
+            if progress == "tty":
                 print(
                     f"\r  column {i:>3}/{len(columns)} ({name[:28]:<28})",
                     end="",
                     flush=True,
                 )
-        if progress:
+            elif column_progress is not None:
+                column_progress.update(i)
+        if progress == "tty":
             print("\r" + " " * 60 + "\r", end="")
+        elif column_progress is not None:
+            column_progress.done(len(columns))
 
         # Persist the exact reorder operation alongside the final catalog.  In
         # particular, this makes the final row -> raw SED row join auditable
@@ -387,8 +399,11 @@ def run(in_dir, out_dir, level, block_rows, overwrite, processes, policy):
 
     if workers == 1:
         # Stay in-process when serial: keeps tracebacks intact, allows the
-        # in-place per-column progress line, and avoids pickling overhead.
-        jobs = [job[:4] + (sys.stdout.isatty(),) + job[5:] for job in jobs]
+        # in-place per-column progress line, and avoids pickling overhead.  On a
+        # TTY use the overwriting single line; in a redirected HPC log use the
+        # time-throttled full-line progress ("line") instead.
+        mode = "tty" if sys.stdout.isatty() else "line"
+        jobs = [job[:4] + (mode,) + job[5:] for job in jobs]
         results = map(process_one, jobs)
     else:
         print(f"Using {workers} worker process(es)\n")
